@@ -1,9 +1,23 @@
+import DequeModule
+
 /// An ordered chain of adjacent batches (top –> bottom). Adjacency is enforced at
 /// the call site — `BatchList.append`/`prepend` trust the caller to have verified
 /// cursor equality. Non-adjacent batches go into separate lists.
+///
+/// `batches` is a `Deque`.
 struct BatchList: Sendable {
     let id: BatchListID
-    var batches: [Batch]
+    var batches: Deque<Batch>
+
+    init(id: BatchListID, batches: Deque<Batch>) {
+        self.id = id
+        self.batches = batches
+    }
+
+    init(id: BatchListID, batches: [Batch]) {
+        self.id = id
+        self.batches = Deque(batches)
+    }
 
     var topCursor: Cursor? { batches.first?.topCursor }
     var bottomCursor: Cursor? { batches.last?.bottomCursor }
@@ -23,5 +37,5 @@ struct BatchList: Sendable {
     }
 
     mutating func append(_ batch: Batch) { batches.append(batch) }
-    mutating func prepend(_ batch: Batch) { batches.insert(batch, at: 0) }
+    mutating func prepend(_ batch: Batch) { batches.prepend(batch) }
 }

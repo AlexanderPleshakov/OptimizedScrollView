@@ -27,6 +27,7 @@ build/
 DerivedData/
 .build/
 .swiftpm/
+Package.resolved
 
 # Obj-C/Swift specific
 *.hmap

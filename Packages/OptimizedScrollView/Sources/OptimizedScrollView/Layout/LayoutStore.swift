@@ -1,16 +1,35 @@
 import CoreGraphics
+import DequeModule
 
 @MainActor
 final class LayoutStore {
-    private(set) var order: [ItemID] = []
+    /// Items and headers are kept in `Deque`s rather than `Array`s so prepend
+    /// (the `loadPrevious` path) is amortized O(1) at the storage layer.
+    /// Both still index by `Int`, so everything that walks them — the binary
+    /// search, `attributes(in:)`, header sticky math — stays unchanged.
+    private(set) var order: Deque<ItemID> = []
     private var indexById: [ItemID: Int] = [:]
-    private var attrs: [LayoutAttributes] = []
+    private var attrs: Deque<LayoutAttributes> = []
     private(set) var contentHeight: CGFloat = 0
 
-    private(set) var headerOrder: [ItemID] = []
+    private(set) var headerOrder: Deque<ItemID> = []
     private var headerIndexById: [ItemID: Int] = [:]
-    private var headerAttrs: [LayoutAttributes] = []
+    private var headerAttrs: Deque<LayoutAttributes> = []
     private var headerGroupIds: [ItemID: ItemID] = [:]
+
+    /// y-coordinate of the topmost subview (item or header) in the layout.
+    /// Equals 0 for a freshly-rebuilt layout, decreases below 0 each time
+    /// `prependItems` runs — prepended history sits in the negative-y region
+    /// rather than displacing existing items down. Callers convert this into
+    /// a `prependHeadroom` for `contentInset.top` so the negative region is
+    /// reachable by scrolling up.
+    private(set) var topY: CGFloat = 0
+
+    /// Sum of the negative-y prepended region and the positive-y existing
+    /// region — i.e., the full vertical extent of the laid-out content.
+    /// Used by `BottomAnchoring` (decides whether to pad the top) and by the
+    /// facade when computing `contentInset.top`.
+    var totalScrollableHeight: CGFloat { contentHeight - min(0, topY) }
 
     var count: Int { order.count }
     var isEmpty: Bool { order.isEmpty }
@@ -21,7 +40,7 @@ final class LayoutStore {
         indexById[id].map { attrs[$0] }
     }
     func frame(for id: ItemID) -> CGRect? { attributes(for: id)?.frame }
-    func allAttributes() -> [LayoutAttributes] { attrs }
+    func allAttributes() -> [LayoutAttributes] { Array(attrs) }
 
     /// First item index whose frame.maxY is strictly greater than y.
     func firstIndex(intersecting y: CGFloat) -> Int {
@@ -80,6 +99,16 @@ final class LayoutStore {
         return out
     }
 
+    /// First/last item ids — used by callers that need to inspect the boundary
+    /// of the laid-out range without poking the deque directly.
+    var firstItemId: ItemID? { order.first }
+    var lastItemId: ItemID? { order.last }
+
+    /// First/last header attributes — used by the engine when computing the
+    /// seam between an existing layout and a prepended/appended block.
+    var firstHeaderAttributes: LayoutAttributes? { headerAttrs.first }
+    var lastHeaderAttributes: LayoutAttributes? { headerAttrs.last }
+
     // MARK: - Mutations
 
     func replaceAll(
@@ -91,17 +120,21 @@ final class LayoutStore {
     ) {
         precondition(order.count == attributes.count)
         precondition(headerOrder.count == headerAttributes.count)
-        self.order = order
-        self.attrs = attributes
+        self.order = Deque(order)
+        self.attrs = Deque(attributes)
         self.indexById = .init(uniqueKeysWithValues: order.enumerated().map { ($1, $0) })
-        self.headerOrder = headerOrder
-        self.headerAttrs = headerAttributes
+        self.headerOrder = Deque(headerOrder)
+        self.headerAttrs = Deque(headerAttributes)
         self.headerIndexById = .init(uniqueKeysWithValues: headerOrder.enumerated().map { ($1, $0) })
         self.headerGroupIds = headerGroupIds
 
         let lastItemY = attributes.last?.frame.maxY ?? 0
         let lastHeaderY = headerAttributes.last?.frame.maxY ?? 0
         self.contentHeight = max(lastItemY, lastHeaderY)
+        // rebuildAll always lays out from y=0, so the topmost subview sits at 0.
+        self.topY = 0
+
+        print("replaceAll \(attributes.count)")
     }
 
     /// Patches a single item's height and shifts everything below — both items and
@@ -121,5 +154,125 @@ final class LayoutStore {
             contentHeight += delta
         }
         return delta
+    }
+
+    // MARK: - Incremental: append at the bottom
+    
+    /// Add items in the start of list.
+    ///
+    /// Used when the diff is a pure tail growth — `loadNext`, push. Item attrs
+    /// arrive with absolute y already laid out from the previous `contentHeight`.
+    /// Headers ditto. `indexById` / `headerIndexById` get keys appended without
+    /// touching existing entries. Cost: O(new items + new headers) — no full
+    /// rebuild of either index dictionary.
+    ///
+    /// - Complexity: O(*m*), where *m* is the count of `attributes + headerAttributes` items.
+    func appendItems(
+        attributes newAttrs: [LayoutAttributes],
+        headerAttributes newHeaders: [LayoutAttributes] = [],
+        headerGroupIds newHeaderGroups: [ItemID: ItemID] = [:],
+        newContentHeight: CGFloat
+    ) {
+        let baseItemIndex = order.count
+        for (offset, attr) in newAttrs.enumerated() {
+            order.append(attr.id)
+            attrs.append(attr)
+            indexById[attr.id] = baseItemIndex + offset
+        }
+        let baseHeaderIndex = headerOrder.count
+        for (offset, header) in newHeaders.enumerated() {
+            headerOrder.append(header.id)
+            headerAttrs.append(header)
+            headerIndexById[header.id] = baseHeaderIndex + offset
+        }
+        for (k, v) in newHeaderGroups { headerGroupIds[k] = v }
+        contentHeight = newContentHeight
+
+        print("appendItems \(newAttrs.count)")
+    }
+
+    // MARK: - Incremental: prepend at the top
+    
+    /// Add items in the end of list
+    ///
+    /// The existing items keep their stored y values untouched. New items go
+    /// into the negative-y region: their block-local y in [0, blockHeight] is
+    /// translated by `topY - blockHeight` so the block's bottom (y=blockHeight)
+    /// sits exactly at the current `topY`. After prepend, `topY -= blockHeight`.
+    ///
+    /// The facade adds `max(0, -topY)` to `contentInset.top` so the negative
+    /// region is reachable by scrolling up.
+    ///
+    /// - Complexity: O(*m*), where *m* is the count of `blockAttributes + blockHeaderAttributes` items.
+    func prependItems(
+        blockAttributes blockAttrs: [LayoutAttributes],
+        blockHeaderAttributes blockHeaders: [LayoutAttributes] = [],
+        headerGroupIds newHeaderGroups: [ItemID: ItemID] = [:],
+        blockHeight: CGFloat
+    ) {
+        let itemCount = blockAttrs.count
+        let headerCount = blockHeaders.count
+        let yShift = topY - blockHeight
+
+        // Bump existing index-dict values; we don't touch the existing y values.
+        if itemCount > 0 {
+            for key in indexById.keys { indexById[key]! += itemCount }
+        }
+        if headerCount > 0 {
+            for key in headerIndexById.keys { headerIndexById[key]! += headerCount }
+        }
+
+        // Translate the block from its block-local y=[0, blockHeight] to
+        // absolute y=[topY-blockHeight, topY], then prepend.
+        var translatedItems = blockAttrs
+        for i in translatedItems.indices { translatedItems[i].frame.origin.y += yShift }
+        var translatedHeaders = blockHeaders
+        for i in translatedHeaders.indices { translatedHeaders[i].frame.origin.y += yShift }
+
+        order.prepend(contentsOf: translatedItems.lazy.map(\.id))
+        attrs.prepend(contentsOf: translatedItems)
+        for (offset, attr) in translatedItems.enumerated() {
+            indexById[attr.id] = offset
+        }
+
+        headerOrder.prepend(contentsOf: translatedHeaders.lazy.map(\.id))
+        headerAttrs.prepend(contentsOf: translatedHeaders)
+        for (offset, header) in translatedHeaders.enumerated() {
+            headerIndexById[header.id] = offset
+        }
+        for (k, v) in newHeaderGroups { headerGroupIds[k] = v }
+
+        topY -= blockHeight
+        // contentHeight is unchanged: the block sits above the existing
+        // content; nothing was added below.
+
+        print("prependItems(negative-y) \(blockAttrs.count) topY=\(topY)")
+    }
+
+    /// Removes the topmost header. Used by the engine in the seam case
+    /// (last prepended item shares its group with the first existing item) —
+    /// the existing leading header is now redundant and would collide with
+    /// the new block's leading header. Recomputes `topY`.
+    func dropFirstHeader() {
+        guard !headerOrder.isEmpty else { return }
+        let removedId = headerOrder.removeFirst()
+        headerAttrs.removeFirst()
+        headerIndexById.removeValue(forKey: removedId)
+        headerGroupIds.removeValue(forKey: removedId)
+        for key in headerIndexById.keys { headerIndexById[key]! -= 1 }
+        recomputeTopY()
+
+        print("dropFirstHeader -> topY=\(topY)")
+    }
+
+    private func recomputeTopY() {
+        let firstItemY = attrs.first?.frame.minY
+        let firstHeaderY = headerAttrs.first?.frame.minY
+        switch (firstItemY, firstHeaderY) {
+        case let (i?, h?): topY = min(i, h)
+        case let (i?, nil): topY = i
+        case let (nil, h?): topY = h
+        case (nil, nil): topY = 0
+        }
     }
 }

@@ -7,7 +7,15 @@ let package = Package(
     products: [
         .library(name: "OptimizedScrollView", targets: ["OptimizedScrollView"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-collections.git", from: "1.1.0"),
+    ],
     targets: [
-        .target(name: "OptimizedScrollView"),
+        .target(
+            name: "OptimizedScrollView",
+            dependencies: [
+                .product(name: "DequeModule", package: "swift-collections"),
+            ]
+        ),
     ]
 )

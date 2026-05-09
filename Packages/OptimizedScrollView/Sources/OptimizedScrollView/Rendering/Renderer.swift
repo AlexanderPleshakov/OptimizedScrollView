@@ -15,7 +15,10 @@ final class Renderer {
     private var visibleItems: [ItemID: VisibleCell] = [:]
     private var visibleHeaders: [ItemID: VisibleCell] = [:]
     private var customResolver: ((any ChatItem) -> String)?
-
+    
+    /// The height of the additional render from above and below.
+    ///
+    /// - NOTE: if 1, then an additional height of one screen will be rendered from above and below
     var bufferScreens: CGFloat = 1.0
 
     init(store: LayoutStore, pool: ReusePool, container: UIView) {
@@ -159,7 +162,7 @@ final class Renderer {
     private func addItemView(_ view: UIView) {
         guard let container else { return }
         // headersHost stays at the top of the z-order; insert items below it so
-        // headers always overlay messages without per-frame `bringSubviewToFront`.
+        // headers always overlay messages.
         if headersHost.superview === container {
             container.insertSubview(view, belowSubview: headersHost)
         } else {

@@ -111,10 +111,43 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
 
     public func apply(_ changes: [Change]) {
         guard !changes.isEmpty else { return }
+
+        // Fast path: when the change set is a contiguous tail-append (push,
+        // `loadNext` snapshot diff), skip `DiffApplier.plan` and the full
+        // `rebuildAll` and run `engine.appendItems` instead.
+        if let appended = pureTailAppend(from: changes) {
+            let capture = anchors.capture(contentOffsetY: contentOffset.y, topInset: contentInset.top)
+            for item in appended { items[item.id] = item }
+            engine.appendItems(appended, headerProvider: headerProvider)
+            commitMutation(restoring: capture)
+            return
+        }
+
+        // Fast path: contiguous head-prepend (`loadPrevious` snapshot diff).
+        // `engine.tryPrependIncrementally` lays the new block in the
+        // negative-y region (no shift of existing items) and returns false
+        // when it would force renumbering of existing `#N` header ids — that
+        // case falls through to the `rebuildAll` path below.
+        if !engine.store.isEmpty, let prepended = pureHeadPrepend(from: changes) {
+            let savedOffsetY = contentOffset.y
+            let firstExistingGroup = engine.store.firstItemId.flatMap { items[$0]?.groupId }
+            if engine.tryPrependIncrementally(
+                prepended,
+                headerProvider: headerProvider,
+                firstExistingGroup: firstExistingGroup
+            ) {
+                for item in prepended { items[item.id] = item }
+                commitPrependIncremental(savedOffsetY: savedOffsetY)
+                return
+            }
+            // Fall through: tryPrependIncrementally bailed without mutating
+            // the store, so the slow path picks up cleanly.
+        }
+
         let capture = anchors.capture(contentOffsetY: contentOffset.y, topInset: contentInset.top)
         let plan = DiffApplier.plan(
             changes: changes,
-            currentOrder: engine.store.order,
+            currentOrder: Array(engine.store.order),
             currentItems: items
         )
         items = plan.newItems
@@ -123,6 +156,64 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         renderer.recycleRemoved(ids: plan.removed)
         renderer.reconfigureVisible(ids: plan.modelChanged, items: items)
         commitMutation(restoring: capture)
+    }
+
+    /// Returns the new items as a contiguous tail-append, or nil if the change
+    /// set isn't a pure tail append (mixed insert positions, removes, or
+    /// updates make this impossible).
+    private func pureTailAppend(from changes: [Change]) -> [any ChatItem]? {
+        var inserts: [(at: Int, item: any ChatItem)] = []
+        inserts.reserveCapacity(changes.count)
+        for change in changes {
+            switch change {
+            case .insert(let item, let at):
+                inserts.append((at, item))
+            case .remove, .update:
+                return nil
+            }
+        }
+        inserts.sort { $0.at < $1.at }
+        let baseIndex = engine.store.order.count
+        for (offset, entry) in inserts.enumerated() {
+            if entry.at != baseIndex + offset { return nil }
+        }
+        return inserts.map(\.item)
+    }
+
+    /// Returns the new items as a contiguous head-prepend (inserts at indices
+    /// 0…K-1), or nil if the change set is anything else.
+    private func pureHeadPrepend(from changes: [Change]) -> [any ChatItem]? {
+        var inserts: [(at: Int, item: any ChatItem)] = []
+        inserts.reserveCapacity(changes.count)
+        for change in changes {
+            switch change {
+            case .insert(let item, let at):
+                inserts.append((at, item))
+            case .remove, .update:
+                return nil
+            }
+        }
+        inserts.sort { $0.at < $1.at }
+        for (offset, entry) in inserts.enumerated() {
+            if entry.at != offset { return nil }
+        }
+        return inserts.map(\.item)
+    }
+
+    /// Commit path for the incremental prepend: the existing items kept their
+    /// content y values, so visual stability boils down to keeping
+    /// `contentOffset.y` exactly where it was. We deliberately bypass the
+    /// `AnchorController` formula here — its `(currentTopInset - captureTopInset)`
+    /// term is designed for the y-shift world; with the negative-y trick
+    /// the anchor item's content y did NOT change, so applying the inset
+    /// delta would visually move it.
+    private func commitPrependIncremental(savedOffsetY: CGFloat) {
+        let newSize = CGSize(width: bounds.width, height: engine.contentHeight)
+        if contentSize != newSize { contentSize = newSize }
+        updateTopInsetForBottomAnchoring()
+        contentOffset.y = savedOffsetY
+        renderer.updateVisible(viewport: currentViewport(), items: items, headerProvider: headerProvider)
+        setNeedsLayout()
     }
 
     public func insert(_ chatItems: [any ChatItem], at index: Int) {
@@ -358,6 +449,15 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         renderer.recycleAll()
         items = Dictionary(uniqueKeysWithValues: newItems.map { ($0.id, $0) })
         engine.rebuildAll(items: newItems, headerProvider: headerProvider)
+        // `rebuildAll` resets `topY` to 0 — the new layout has no
+        // negative-y prepended region. We MUST sync `contentInset.top` to
+        // reflect this immediately. Otherwise the inset stays at the previous
+        // list's `prependHeadroom`; the next mutation that runs through
+        // `commitMutation` (e.g. an `appendItems` after the user scrolls)
+        // would see a stale `capture.topInset`, and the anchor's
+        // `(currentTopInset - capture.topInset)` term would visually jump
+        // the viewport by the leftover prepend headroom.
+        updateTopInsetForBottomAnchoring()
         // pinToBottom == true -> arm initial bottom-pin in the next layout pass.
         // pinToBottom == false -> caller will scroll to a specific target itself.
         didInitialPin = !pinToBottom
@@ -384,7 +484,12 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         guard let dataSource else { return }
         let viewport = currentViewport()
         let threshold = viewport.height
-        let nearTop = viewport.minY <= threshold
+        // Compare the viewport top to the *current* layout top (`engine.topY`),
+        // not to a fixed 0. After any incremental prepend the layout extends
+        // into the negative-y region; a `viewport.minY <= threshold` against 0
+        // would be true on every scroll tick once `topY` has gone below
+        // `-threshold`, kicking off a runaway loadPrevious chain.
+        let nearTop = viewport.minY - engine.topY <= threshold
         let nearBottom = viewport.maxY >= engine.contentHeight - threshold
 
         if nearTop, pendingPrefetchTop == nil {
@@ -434,10 +539,18 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
 
     private func updateTopInsetForBottomAnchoring() {
         let viewportBelowTop = bounds.height - contentInset.bottom
-        let target = BottomAnchoring.topInset(
-            contentHeight: engine.contentHeight,
+        // Bottom-anchoring uses the *full* scrollable extent — including any
+        // negative-y prepended region — so a layout that's gone past viewport
+        // height through prepends doesn't keep getting padded at the top.
+        let bottomAnchorInset = BottomAnchoring.topInset(
+            contentHeight: engine.totalScrollableHeight,
             viewportHeight: viewportBelowTop
         )
+        // Prepend headroom: extra room above contentSize (which starts at y=0)
+        // so the user can scroll up into the negative-y region where prepended
+        // history lives. `engine.topY` is ≤ 0 once any prepend has happened.
+        let prependHeadroom = max(0, -engine.topY)
+        let target = bottomAnchorInset + prependHeadroom
         if contentInset.top != target { contentInset.top = target }
     }
 

@@ -24,8 +24,8 @@ private struct DateHeader: ChatItem {
 /// sleeps 500ms to simulate network latency, exercising the actor's dedup
 /// machinery and the renderer's anchor preservation under async pagination.
 private struct MockChatProvider: ChatDataSourceProvider {
-    static let totalCount = 800
-    static let pageSize = 30
+    static let totalCount = 1500
+    static let pageSize = 100
 
     let allMessages: [Message]
 
@@ -93,31 +93,55 @@ private struct MockChatProvider: ChatDataSourceProvider {
         return CGFloat(lines * 22 + 16)
     }
 
+    // MARK: - Grid-aligned ranges
+    //
+    // Every method below returns a batch whose [start, end) lies on the same
+    // global grid of multiples of `pageSize`. That guarantee is what makes
+    // `ChatDataSource.mergeAdjacentLists` work: when two lists' boundary
+    // cursors coincide (e.g. after a jump+scroll-back-up reaches the original
+    // initial-load slice), the cursors will be exactly equal — they were both
+    // minted from the same grid stride. Without alignment the chain from
+    // `loadBatch` rides a shifted grid (because it centres on the target item)
+    // and never meets `loadInitial`'s boundaries.
+
     func loadInitial() async throws -> Batch {
         try await Self.simulateLatency()
-        let start = max(0, Self.totalCount - Self.pageSize)
+        // Bottom batch on the grid: largest multiple of pageSize that's still
+        // strictly less than totalCount. For totalCount=1500, pageSize=100 →
+        // start=1400.
+        let start = Self.gridFloor(max(0, Self.totalCount - Self.pageSize))
         return makeBatch(range: start..<Self.totalCount)
     }
 
     func loadNext(after cursor: Cursor) async throws -> Batch? {
         try await Self.simulateLatency()
         guard let endIdx = Int(cursor.raw), endIdx < Self.totalCount else { return nil }
+        // `endIdx` itself comes from a previously-emitted batch that was
+        // grid-aligned, so [endIdx, endIdx+pageSize) stays on the grid.
         return makeBatch(range: endIdx..<min(Self.totalCount, endIdx + Self.pageSize))
     }
 
     func loadPrevious(before cursor: Cursor) async throws -> Batch? {
         try await Self.simulateLatency()
         guard let startIdx = Int(cursor.raw), startIdx > 0 else { return nil }
+        // Same reasoning as `loadNext`: `startIdx` is grid-aligned, so the
+        // step back of `pageSize` produces another grid-aligned range.
         return makeBatch(range: max(0, startIdx - Self.pageSize)..<startIdx)
     }
 
     func loadBatch(containing id: ItemID) async throws -> Batch? {
         try await Self.simulateLatency()
         guard let i = allMessages.firstIndex(where: { $0.id == id }) else { return nil }
-        let half = Self.pageSize / 2
-        let start = max(0, min(Self.totalCount - Self.pageSize, i - half))
+        // Grid bucket containing `i` — guaranteed to include the target since
+        // the bucket spans [gridFloor(i), gridFloor(i)+pageSize).
+        let start = Self.gridFloor(i)
         let end = min(Self.totalCount, start + Self.pageSize)
         return makeBatch(range: start..<end)
+    }
+
+    /// Floor `value` to the nearest multiple of `pageSize` (≤ value).
+    private static func gridFloor(_ value: Int) -> Int {
+        (value / Self.pageSize) * Self.pageSize
     }
 
     private func makeBatch(range: Range<Int>) -> Batch {
@@ -135,7 +159,7 @@ private struct MockChatProvider: ChatDataSourceProvider {
     }
 
     static func simulateLatency() async throws {
-        try await Task.sleep(nanoseconds: 500_000_000)
+        try await Task.sleep(nanoseconds: 10_000_000)
     }
 }
 
