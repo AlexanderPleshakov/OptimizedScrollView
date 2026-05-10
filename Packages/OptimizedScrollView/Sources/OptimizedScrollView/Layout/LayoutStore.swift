@@ -18,17 +18,28 @@ final class LayoutStore {
     private var headerGroupIds: [ItemID: ItemID] = [:]
 
     /// y-coordinate of the topmost subview (item or header) in the layout.
-    /// Equals 0 for a freshly-rebuilt layout, decreases below 0 each time
-    /// `prependItems` runs — prepended history sits in the negative-y region
-    /// rather than displacing existing items down. Callers convert this into
-    /// a `prependHeadroom` for `contentInset.top` so the negative region is
-    /// reachable by scrolling up.
+    ///
+    /// - `topY == 0` — long content laid out directly from y=0. The default
+    ///   after `replaceAll`.
+    /// - `topY < 0` — long content with prepended history. The negative-y
+    ///   region holds older items; existing items keep their stored y values.
+    ///   The facade exposes the region by adding `-topY` to `contentInset.top`.
+    /// - `topY > 0` — short content (items shorter than the viewport) shifted
+    ///   downward by `LayoutEngine.setViewportHeight` so the last item's
+    ///   `maxY == viewportHeight` (Approach-B bottom-pin via stored frames,
+    ///   not via `contentInset.top`).
     private(set) var topY: CGFloat = 0
 
-    /// Sum of the negative-y prepended region and the positive-y existing
-    /// region — i.e., the full vertical extent of the laid-out content.
-    /// Used by `BottomAnchoring` (decides whether to pad the top) and by the
-    /// facade when computing `contentInset.top`.
+    /// The y-shift currently baked into stored frames to bottom-pin short
+    /// content. Equals `topY` when positive, 0 otherwise. Cross-mode prepend
+    /// (short→long) collapses this back to 0; subsequent reconcile
+    /// is then a no-op.
+    var bottomFlowOffset: CGFloat { max(0, topY) }
+
+    /// Full vertical extent of the laid-out content (negative-y prepended
+    /// region plus the positive-y region). Used by callers that need to know
+    /// the whole reachable scroll extent regardless of where the topmost
+    /// subview happens to sit.
     var totalScrollableHeight: CGFloat { contentHeight - min(0, topY) }
 
     var count: Int { order.count }
@@ -247,6 +258,26 @@ final class LayoutStore {
         // content; nothing was added below.
 
         print("prependItems(negative-y) \(blockAttrs.count) topY=\(topY)")
+    }
+
+    // MARK: - Incremental: viewport-driven bottom-flow shift
+
+    /// Translates every stored frame (items + headers) along the y-axis by
+    /// `delta`, adjusting `topY` and `contentHeight` to match. Used by the
+    /// engine to apply a `bottomFlowOffset` change after rebuild/append in
+    /// short-content mode and on viewport size changes.
+    ///
+    /// - Complexity: O(items + headers).
+    func shiftAllFrames(delta: CGFloat) {
+        guard delta != 0, !isEmpty else { return }
+        for i in attrs.indices {
+            attrs[i].frame.origin.y += delta
+        }
+        for i in headerAttrs.indices {
+            headerAttrs[i].frame.origin.y += delta
+        }
+        topY += delta
+        contentHeight += delta
     }
 
     /// Removes the topmost header. Used by the engine in the seam case

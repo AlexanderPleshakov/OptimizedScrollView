@@ -17,13 +17,57 @@ final class LayoutEngine {
     /// `prevGroup` when `appendItems` runs.
     private var lastItemGroupId: ItemID? = nil
 
+    /// Latest viewport height seen via `setViewportHeight`. Drives
+    /// `reconcileBottomFlow` — the routine that bottom-pins short content
+    /// by shifting all stored frames downward (Approach B). Mutations
+    /// (`rebuildAll`, `appendItems`, `tryPrependIncrementally`,
+    /// `updateHeight`) reconcile against this value at their tail so the
+    /// store is always in a viewport-consistent state.
+    private var viewportHeight: CGFloat = 0
+
     init(store: LayoutStore) {
         self.store = store
     }
 
     var contentHeight: CGFloat { store.contentHeight }
     var topY: CGFloat { store.topY }
+    var bottomFlowOffset: CGFloat { store.bottomFlowOffset }
     var totalScrollableHeight: CGFloat { store.totalScrollableHeight }
+
+    /// Inform the engine of the current viewport height (`bounds.height -
+    /// contentInset.bottom`). Triggers `reconcileBottomFlow`, which keeps
+    /// the layout's `bottomFlowOffset` aligned with the viewport: a layout
+    /// shorter than the viewport is shifted so the last item's `maxY`
+    /// equals `viewportHeight` (bottom-pin via stored frames); a layout
+    /// at-or-larger has its flow offset collapsed to 0.
+    @discardableResult
+    func setViewportHeight(_ newHeight: CGFloat) -> CGFloat {
+        viewportHeight = newHeight
+        return reconcileBottomFlow()
+    }
+
+    /// Compute and apply the desired `bottomFlowOffset` for the current
+    /// `viewportHeight` and content extent. Returns the y-shift applied
+    /// (0 when nothing changed). The caller can use the return value to
+    /// decide whether to animate the resulting frame movement.
+    @discardableResult
+    private func reconcileBottomFlow() -> CGFloat {
+        guard !store.isEmpty else { return 0 }
+        // `itemsTotal` is the raw vertical extent of the laid-out content
+        // (independent of where the topmost subview happens to sit).
+        let itemsTotal = store.contentHeight - store.topY
+        // `desiredOffset` > 0 only when items are shorter than the viewport;
+        // then we want to shift the whole layout down so the last item sits
+        // at `viewport`. When negative-y prepend has put `topY` below 0 the
+        // content already exceeds the viewport — `desiredOffset` collapses
+        // to 0 and we leave the prepended region alone (`max(0, topY)` is 0
+        // in that branch, so `shift` is 0 too).
+        let desiredOffset = max(0, viewportHeight - itemsTotal)
+        let currentOffset = max(0, store.topY)
+        let shift = desiredOffset - currentOffset
+        if shift != 0 { store.shiftAllFrames(delta: shift) }
+        return shift
+    }
 
     /// Full rebuild — items y-flow with displacing headers between groups. A header
     /// is inserted above the first item of each group (any item whose `groupId`
@@ -81,6 +125,11 @@ final class LayoutEngine {
 
         occurrenceByGroup = occurrence
         lastItemGroupId = prevGroup
+
+        // Bake the bottom-flow offset back in. `replaceAll` resets `topY` to
+        // 0 and lays items from y=0; in short-content mode that would put
+        // them at the top of the viewport instead of pinned at the bottom.
+        reconcileBottomFlow()
     }
 
     /// Incremental tail-append. Called when the diff is a pure growth at the
@@ -135,6 +184,11 @@ final class LayoutEngine {
             newContentHeight: y
         )
         lastItemGroupId = prevGroup
+
+        // In short-content mode, growth here may push past the viewport;
+        // reconcile shifts the whole layout up by `oldOffset` so the
+        // appended item lands exactly at the viewport bottom.
+        reconcileBottomFlow()
     }
 
     /// Patch path — used when only one item's height changed and no group structure
@@ -144,6 +198,9 @@ final class LayoutEngine {
     func updateHeight(id: ItemID, to height: CGFloat) -> LayoutDiff {
         guard let i = store.index(of: id) else { return .empty }
         let delta = store.updateHeight(at: i, height: height)
+        // A height change can flip short↔long mode (e.g. shrinking the only
+        // tall item); reconcile keeps the bottom-flow offset in sync.
+        reconcileBottomFlow()
         return LayoutDiff(changed: [id], contentSizeDelta: delta)
     }
 
@@ -258,6 +315,16 @@ final class LayoutEngine {
         }
         // `lastItemGroupId` is unchanged — the last item is still whichever
         // existing item was at the bottom before this prepend.
+
+        // Reconcile is a no-op in pure long-content prepend (currentOffset
+        // stays 0, desiredOffset stays 0). In short-content prepend that
+        // doesn't yet exceed the viewport, `topY` after `prependItems`
+        // already equals the new desired offset (block was placed at
+        // `[topY-blockHeight, topY]`, so `currentOffset == desiredOffset`).
+        // In a short→long crossing prepend, the block went into negative-y;
+        // again `currentOffset` is 0 (`topY` is now negative). So the call
+        // is defensive — kept for symmetry and future-proofing.
+        reconcileBottomFlow()
 
         return true
     }

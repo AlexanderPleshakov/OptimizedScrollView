@@ -102,8 +102,26 @@ final class Renderer {
                 let reuseId = resolveReuseId(for: item)
                 let view = pool.dequeue(reuseId: reuseId)
                 pool.configure(view, with: item, reuseId: reuseId)
+                // New cells are added to the hierarchy at an "entry" frame just
+                // below the visible viewport. When `updateVisible` runs inside
+                // a `UIView.animate` block (short-content push, where existing
+                // items shift upward), the *target* frame assignment below
+                // produces a "bottom-up slide" — the cell appears from below
+                // the visible area and rises into place alongside the shifted
+                // existing items. Outside an animation block the assignments
+                // collapse to a single layout step (final frame), so the cost
+                // is just one extra synchronous frame write — no visual cost.
+                let entryFrame = CGRect(
+                    x: 0,
+                    y: viewport.maxY,
+                    width: width,
+                    height: attr.frame.height
+                )
+                UIView.performWithoutAnimation {
+                    view.frame = entryFrame
+                    addItemView(view)
+                }
                 view.frame = target
-                addItemView(view)
                 visibleItems[attr.id] = VisibleCell(view: view, reuseId: reuseId)
             }
         }

@@ -27,6 +27,12 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
     public init() {
         super.init(frame: .zero)
         contentInsetAdjustmentBehavior = .never
+        // Approach B: short-content layouts bottom-pin via stored-frame shift,
+        // not via `contentInset.top`. Their `contentSize.height` equals the
+        // viewport height, so the natural scrollable region is degenerate.
+        // `alwaysBounceVertical` re-enables the elastic rubber-band gesture
+        // that users expect from a "scroll view that just happens to fit".
+        alwaysBounceVertical = true
         delegate = self
     }
 
@@ -94,11 +100,40 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
             // No data source bound — fall through to a direct append.
             let wasAtBottom = isPinnedToBottom()
             let endIndex = engine.store.order.count
-            apply(newItems.enumerated().map { .insert($1, at: endIndex + $0) })
+            let changes = newItems.enumerated().map { Change.insert($1, at: endIndex + $0) }
+            commitPushApply(changes, wasAtBottom: wasAtBottom, addedCount: newItems.count)
+        }
+    }
+
+    /// Shared push-mutation commit. Bottom-pinned short-content push needs
+    /// the existing items' frame shift (caused by the bottom-flow offset
+    /// shrinking when new items arrive) to animate, otherwise the visible
+    /// items snap upward in a single frame. Wrapping `apply` in
+    /// `UIView.animate` makes the renderer's frame assignments interpolate.
+    private func commitPushApply(
+        _ changes: [Change],
+        wasAtBottom: Bool,
+        addedCount: Int
+    ) {
+        // Pre-mutation `bottomFlowOffset > 0` is a sufficient predicate for
+        // "stored frames will shift" — appending grows itemsTotal so the
+        // offset can only stay equal-or-shrink. If we were already long,
+        // append doesn't move existing items at all.
+        let willShift = wasAtBottom && engine.bottomFlowOffset > 0
+        if willShift {
+            UIView.animate(
+                withDuration: 0.25,
+                delay: 0,
+                options: [.curveEaseInOut, .beginFromCurrentState]
+            ) { [self] in
+                apply(changes)
+            }
+        } else {
+            apply(changes)
             if wasAtBottom {
                 scrollSyncToBottom(animated: true)
             } else {
-                chatDelegate?.didReceiveNewItemsWhileScrolledUp(count: newItems.count)
+                chatDelegate?.didReceiveNewItemsWhileScrolledUp(count: addedCount)
             }
         }
     }
@@ -210,7 +245,7 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
     private func commitPrependIncremental(savedOffsetY: CGFloat) {
         let newSize = CGSize(width: bounds.width, height: engine.contentHeight)
         if contentSize != newSize { contentSize = newSize }
-        updateTopInsetForBottomAnchoring()
+        syncTopInsetForPrependHeadroom()
         contentOffset.y = savedOffsetY
         renderer.updateVisible(viewport: currentViewport(), items: items, headerProvider: headerProvider)
         setNeedsLayout()
@@ -239,12 +274,22 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         let apply: () -> Void = { [self] in
             contentInset.bottom = inset
             verticalScrollIndicatorInsets.bottom = inset
-            updateTopInsetForBottomAnchoring()
+            // Bottom inset shrinks the visible area below the top inset, so
+            // the bottom-flow offset may need to grow/shrink — reconcile
+            // before consulting engine geometry.
+            engine.setViewportHeight(bounds.height - inset)
+            syncTopInsetForPrependHeadroom()
+            let newSize = CGSize(width: bounds.width, height: engine.contentHeight)
+            if contentSize != newSize { contentSize = newSize }
             if wasAtBottom {
                 contentOffset.y = bottomPinnedOffsetY()
             } else if let c = capture, let y = anchors.restoredOffsetY(for: c, currentTopInset: contentInset.top) {
                 contentOffset.y = y
             }
+            // Push the post-shift frames to UIView during the animation
+            // block so item movement (when bottom-flow changed) animates
+            // alongside the inset/offset.
+            renderer.updateVisible(viewport: currentViewport(), items: items, headerProvider: headerProvider)
         }
         if animated {
             UIView.animate(withDuration: 0.25, delay: 0, options: [.curveEaseInOut, .beginFromCurrentState], animations: apply)
@@ -318,9 +363,6 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
     public override func layoutSubviews() {
         super.layoutSubviews()
 
-        let newSize = CGSize(width: bounds.width, height: engine.contentHeight)
-        if contentSize != newSize { contentSize = newSize }
-
         let boundsChanged = bounds.size != lastBoundsSize
         let needInitialPin = !didInitialPin && !engine.store.isEmpty && bounds.height > 0
 
@@ -330,7 +372,14 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
             let wasAtBottom = prevSize.height > 0
                 && contentOffset.y + prevSize.height - contentInset.bottom >= engine.contentHeight - 1
             let capture = anchors.capture(contentOffsetY: contentOffset.y, topInset: contentInset.top)
-            updateTopInsetForBottomAnchoring()
+            // Viewport height drives the bottom-flow offset baked into stored
+            // frames; reconcile before consulting `engine.contentHeight`
+            // (which now includes that offset in short-content mode).
+            engine.setViewportHeight(bounds.height - contentInset.bottom)
+            syncTopInsetForPrependHeadroom()
+
+            let newSize = CGSize(width: bounds.width, height: engine.contentHeight)
+            if contentSize != newSize { contentSize = newSize }
 
             if !didInitialPin && !engine.store.isEmpty {
                 contentOffset.y = bottomPinnedOffsetY()
@@ -340,6 +389,9 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
             } else if let c = capture, let y = anchors.restoredOffsetY(for: c, currentTopInset: contentInset.top) {
                 contentOffset.y = y
             }
+        } else {
+            let newSize = CGSize(width: bounds.width, height: engine.contentHeight)
+            if contentSize != newSize { contentSize = newSize }
         }
 
         renderer.updateVisible(viewport: currentViewport(), items: items, headerProvider: headerProvider)
@@ -383,11 +435,22 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         // their view shifted — surface only the delegate event.
         if currentListId == snapshot.listId {
             let wasAtBottom = isPinnedToBottom()
-            applySnapshotDiff(snapshot)
-            if wasAtBottom {
-                scrollSyncToBottom(animated: true)
+            let willShift = wasAtBottom && engine.bottomFlowOffset > 0
+            if willShift {
+                UIView.animate(
+                    withDuration: 0.25,
+                    delay: 0,
+                    options: [.curveEaseInOut, .beginFromCurrentState]
+                ) { [self] in
+                    applySnapshotDiff(snapshot)
+                }
             } else {
-                chatDelegate?.didReceiveNewItemsWhileScrolledUp(count: addedCount)
+                applySnapshotDiff(snapshot)
+                if wasAtBottom {
+                    scrollSyncToBottom(animated: true)
+                } else {
+                    chatDelegate?.didReceiveNewItemsWhileScrolledUp(count: addedCount)
+                }
             }
         } else {
             chatDelegate?.didReceiveNewItemsWhileScrolledUp(count: addedCount)
@@ -448,6 +511,13 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
     private func setItemsInternal(_ newItems: [any ChatItem], pinToBottom: Bool) {
         renderer.recycleAll()
         items = Dictionary(uniqueKeysWithValues: newItems.map { ($0.id, $0) })
+        // Refresh the engine's known viewport before rebuild so the
+        // `reconcileBottomFlow` call inside `rebuildAll` can immediately
+        // bottom-pin short content via stored-frame shift. When bounds
+        // aren't available yet (first call before layoutSubviews), this
+        // passes 0 and the reconcile is a no-op — `layoutSubviews` will
+        // reconcile when bounds become real.
+        engine.setViewportHeight(bounds.height - contentInset.bottom)
         engine.rebuildAll(items: newItems, headerProvider: headerProvider)
         // `rebuildAll` resets `topY` to 0 — the new layout has no
         // negative-y prepended region. We MUST sync `contentInset.top` to
@@ -457,7 +527,7 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         // would see a stale `capture.topInset`, and the anchor's
         // `(currentTopInset - capture.topInset)` term would visually jump
         // the viewport by the leftover prepend headroom.
-        updateTopInsetForBottomAnchoring()
+        syncTopInsetForPrependHeadroom()
         // pinToBottom == true -> arm initial bottom-pin in the next layout pass.
         // pinToBottom == false -> caller will scroll to a specific target itself.
         didInitialPin = !pinToBottom
@@ -470,7 +540,7 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
     }
 
     private func commitMutation(restoring capture: AnchorController.Capture?) {
-        updateTopInsetForBottomAnchoring()
+        syncTopInsetForPrependHeadroom()
         let newSize = CGSize(width: bounds.width, height: engine.contentHeight)
         if contentSize != newSize { contentSize = newSize }
         if let c = capture, let y = anchors.restoredOffsetY(for: c, currentTopInset: contentInset.top) {
@@ -537,30 +607,26 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         if !animated { scrollState.didEndProgrammaticScroll() }
     }
 
-    private func updateTopInsetForBottomAnchoring() {
-        let viewportBelowTop = bounds.height - contentInset.bottom
-        // Bottom-anchoring uses the *full* scrollable extent — including any
-        // negative-y prepended region — so a layout that's gone past viewport
-        // height through prepends doesn't keep getting padded at the top.
-        let bottomAnchorInset = BottomAnchoring.topInset(
-            contentHeight: engine.totalScrollableHeight,
-            viewportHeight: viewportBelowTop
-        )
-        // Prepend headroom: extra room above contentSize (which starts at y=0)
-        // so the user can scroll up into the negative-y region where prepended
-        // history lives. `engine.topY` is ≤ 0 once any prepend has happened.
+    private func syncTopInsetForPrependHeadroom() {
+        // Approach B: bottom-pin for short content lives in stored frames
+        // (`engine.bottomFlowOffset` — items shifted down so their `maxY`
+        // sits at the viewport bottom), not in `contentInset.top`. The only
+        // remaining contributor to `contentInset.top` is prepend headroom:
+        // extra room above contentSize so the user can scroll up into the
+        // negative-y region where prepended history lives. `engine.topY` is
+        // ≤ 0 once any prepend has happened.
         let prependHeadroom = max(0, -engine.topY)
-        let target = bottomAnchorInset + prependHeadroom
-        if contentInset.top != target { contentInset.top = target }
+        if contentInset.top != prependHeadroom { contentInset.top = prependHeadroom }
     }
 
     private func bottomPinnedOffsetY() -> CGFloat {
+        // In short-content mode the layout already pins items to the bottom
+        // through `engine.bottomFlowOffset`, so `contentSize.height` equals
+        // `viewportBelowTop` and the natural bottom offset is 0 (or
+        // `-contentInset.top` if a prepend headroom is in play). In long
+        // mode the offset is the usual contentSize - viewport.
         let viewportBelowTop = bounds.height - contentInset.bottom
-        return BottomAnchoring.bottomPinnedOffsetY(
-            contentHeight: engine.contentHeight,
-            viewportHeight: viewportBelowTop,
-            topInset: contentInset.top
-        )
+        return max(-contentInset.top, engine.contentHeight - viewportBelowTop)
     }
 
     private func isPinnedToBottom(epsilon: CGFloat = 0.5) -> Bool {
