@@ -97,31 +97,38 @@ final class Renderer {
             guard let item = items[attr.id] else { continue }
             let target = CGRect(x: 0, y: attr.frame.minY, width: width, height: attr.frame.height)
             if let cell = visibleItems[attr.id] {
-                if cell.view.frame != target { cell.view.frame = target }
+                if cell.view.frame != target {
+                    // Frame moves are layout, not animation. The push-flow's
+                    // visual motion comes from the scroll view's bounds.origin
+                    // animation (driven by `UIView.animate { contentOffset.y = ... }`
+                    // in the facade); cell frames in *content* coordinates must
+                    // change synchronously so they appear stationary on screen
+                    // while the bounds animates. Wrapping in
+                    // `performWithoutAnimation` guards against the case where
+                    // this method runs inside an active CATransaction (e.g.
+                    // when invoked from `scrollViewDidScroll` that fired
+                    // synchronously from setting `contentOffset.y` inside the
+                    // facade's `UIView.animate` block).
+                    UIView.performWithoutAnimation { cell.view.frame = target }
+                }
             } else {
                 let reuseId = resolveReuseId(for: item)
                 let view = pool.dequeue(reuseId: reuseId)
                 pool.configure(view, with: item, reuseId: reuseId)
-                // New cells are added to the hierarchy at an "entry" frame just
-                // below the visible viewport. When `updateVisible` runs inside
-                // a `UIView.animate` block (short-content push, where existing
-                // items shift upward), the *target* frame assignment below
-                // produces a "bottom-up slide" — the cell appears from below
-                // the visible area and rises into place alongside the shifted
-                // existing items. Outside an animation block the assignments
-                // collapse to a single layout step (final frame), so the cost
-                // is just one extra synchronous frame write — no visual cost.
-                let entryFrame = CGRect(
-                    x: 0,
-                    y: viewport.maxY,
-                    width: width,
-                    height: attr.frame.height
-                )
+                // Place the cell directly at its target frame. The earlier
+                // design used an "entry frame" at `viewport.maxY` followed by a
+                // frame change to target *outside* `performWithoutAnimation`
+                // to interpolate "from below" while the facade ran `apply`
+                // inside `UIView.animate`. The push path no longer wraps the
+                // mutation in an animation block, so the two-step is dead
+                // weight — and worse, a freshly added layer occasionally
+                // picks up an implicit position animation on the second
+                // assignment, producing a visible slide that fights the
+                // bounds animation. One synchronous placement, no animation.
                 UIView.performWithoutAnimation {
-                    view.frame = entryFrame
+                    view.frame = target
                     addItemView(view)
                 }
-                view.frame = target
                 visibleItems[attr.id] = VisibleCell(view: view, reuseId: reuseId)
             }
         }
@@ -156,13 +163,35 @@ final class Renderer {
             let target = CGRect(x: 0, y: pinnedY, width: width, height: attr.frame.height)
 
             if let cell = visibleHeaders[attr.id] {
-                if cell.view.frame != target { cell.view.frame = target }
+                if cell.view.frame != target {
+                    // Same reasoning as the item-cell move: a header frame
+                    // change that happens to land inside an active CATransaction
+                    // (e.g. via `scrollViewDidScroll` firing synchronously from
+                    // `contentOffset.y = …` inside the facade's `UIView.animate`)
+                    // would otherwise pick up an implicit position animation.
+                    UIView.performWithoutAnimation { cell.view.frame = target }
+                }
             } else {
                 let reuseId = resolveReuseId(for: model)
                 let view = pool.dequeue(reuseId: reuseId)
                 pool.configure(view, with: model, reuseId: reuseId)
-                view.frame = target
-                headersHost.addSubview(view)
+                // First-push pathology: when a push introduces a brand-new
+                // sticky group (e.g. "today" landing in a chat whose existing
+                // items all belong to older days), the new header view is
+                // created *inside* the facade's `UIView.animate { contentOffset.y = … }`
+                // block — `scrollViewDidScroll` fires synchronously from the
+                // offset assignment, this method runs, and the new header
+                // becomes visible only after the offset moves back to 0.
+                // Setting `view.frame = target` on a freshly-allocated layer
+                // inside an active CATransaction creates an implicit position
+                // animation from `(0, 0)` (presentation layer default) to the
+                // target frame, producing a visible "header descends from the
+                // top of the screen" slide on the first push only. Subsequent
+                // pushes hit an existing header view, so the path doesn't fire.
+                UIView.performWithoutAnimation {
+                    view.frame = target
+                    headersHost.addSubview(view)
+                }
                 visibleHeaders[attr.id] = VisibleCell(view: view, reuseId: reuseId)
             }
         }

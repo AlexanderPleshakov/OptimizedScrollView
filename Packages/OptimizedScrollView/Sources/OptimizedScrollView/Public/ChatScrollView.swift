@@ -121,12 +121,22 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         // append doesn't move existing items at all.
         let willShift = wasAtBottom && engine.bottomFlowOffset > 0
         if willShift {
+            apply(changes)
             UIView.animate(
                 withDuration: 0.25,
                 delay: 0,
                 options: [.curveEaseInOut, .beginFromCurrentState]
             ) { [self] in
-                apply(changes)
+                // `apply` runs through `commitMutation`, which restores the
+                // pre-mutation offset via `AnchorController`. In short-content
+                // mode `reconcileBottomFlow` shifted every stored frame upward
+                // to keep the last item pinned to the viewport bottom; the
+                // anchor formula then visually undoes that shift by setting
+                // `contentOffset.y` into the rubber-band region (negative).
+                // The two cancel out and the new item ends up *below* the
+                // visible bounds. Re-pin to the bottom inside the animation
+                // block so the offset target matches the frame shift.
+                contentOffset.y = bottomPinnedOffsetY()
             }
         } else {
             apply(changes)
@@ -437,12 +447,18 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
             let wasAtBottom = isPinnedToBottom()
             let willShift = wasAtBottom && engine.bottomFlowOffset > 0
             if willShift {
+                applySnapshotDiff(snapshot)
                 UIView.animate(
                     withDuration: 0.25,
                     delay: 0,
                     options: [.curveEaseInOut, .beginFromCurrentState]
                 ) { [self] in
-                    applySnapshotDiff(snapshot)
+                    // See the matching comment in `commitPushApply`:
+                    // `commitMutation`'s anchor restore would push
+                    // `contentOffset.y` into rubber-band territory and
+                    // visually cancel the bottom-flow frame shift, hiding
+                    // the freshly appended item below the screen edge.
+                    contentOffset.y = bottomPinnedOffsetY()
                 }
             } else {
                 applySnapshotDiff(snapshot)
