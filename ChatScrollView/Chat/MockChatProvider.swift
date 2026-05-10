@@ -7,7 +7,7 @@ import OptimizedScrollView
 /// dedup machinery and the renderer's anchor preservation under async pagination.
 struct MockChatProvider: ChatDataSourceProvider {
     static let totalCount = 1500
-    static let pageSize = 100
+    static let pageSize = 30
 
     let allMessages: [Message]
 
@@ -114,10 +114,21 @@ struct MockChatProvider: ChatDataSourceProvider {
     func loadBatch(containing id: ItemID) async throws -> Batch? {
         try await Self.simulateLatency()
         guard let i = allMessages.firstIndex(where: { $0.id == id }) else { return nil }
-        // Grid bucket containing `i` — guaranteed to include the target since
-        // the bucket spans [gridFloor(i), gridFloor(i)+pageSize).
-        let start = Self.gridFloor(i)
-        let end = min(Self.totalCount, start + Self.pageSize)
+        // Three grid buckets around the target: one bucket before, the bucket
+        // containing the target, and one bucket after. This guarantees the
+        // target falls roughly in the middle third of the loaded content so
+        // `ChatScrollView`'s `centeredOffsetY(for:)` has room above and below
+        // to actually centre it — a single-bucket batch puts targets whose
+        // index lies near a grid boundary (e.g. i=1200) at the top of the
+        // loaded range and the centring clamp fires, dumping the user at
+        // the top of the viewport instead of centring the target.
+        //
+        // start/end stay multiples of `pageSize` so `mergeAdjacentLists`
+        // can still bridge this batch with prior `loadInitial` / `loadNext`
+        // chains via cursor equality.
+        let bucket = Self.gridFloor(i)
+        let start = max(0, bucket - Self.pageSize)
+        let end = min(Self.totalCount, bucket + 2 * Self.pageSize)
         return makeBatch(range: start..<end)
     }
 
@@ -147,6 +158,7 @@ struct MockChatProvider: ChatDataSourceProvider {
 
 extension MockChatProvider {
     func randomKnownId() -> ItemID {
+//        allMessages[600].id
         allMessages.randomElement()!.id
     }
 

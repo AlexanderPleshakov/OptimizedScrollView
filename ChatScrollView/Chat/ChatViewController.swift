@@ -118,4 +118,33 @@ final class ChatViewController: UIViewController, ChatScrollViewDelegate {
     func didFailLoad(_ error: Error) {
         print("Load failed: \(error)")
     }
+    
+    func didScrollToItem(id: ItemID) {
+        guard let cellView = chat.visibleView(for: id) else { return }
+        flashHighlight(on: cellView)
+    }
+
+    /// Layers a translucent yellow overlay on top of the cell and fades it
+    /// out. Using a sibling overlay (rather than mutating the cell's own
+    /// backgroundColor) keeps the flash independent of `configure(with:)`,
+    /// which sets the background based on `isOutgoing` and would otherwise
+    /// clobber a mid-animation colour if the cell were recycled.
+    private func flashHighlight(on cellView: UIView) {
+        let overlay = UIView(frame: cellView.bounds)
+        overlay.backgroundColor = UIColor.systemYellow.withAlphaComponent(0.45)
+        overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        overlay.isUserInteractionEnabled = false
+        overlay.layer.cornerRadius = cellView.layer.cornerRadius
+        cellView.addSubview(overlay)
+
+        UIView.animate(
+            withDuration: 0.9,
+            delay: 0.15,
+            options: [.curveEaseOut]
+        ) {
+            overlay.alpha = 0
+        } completion: { _ in
+            overlay.removeFromSuperview()
+        }
+    }
 }

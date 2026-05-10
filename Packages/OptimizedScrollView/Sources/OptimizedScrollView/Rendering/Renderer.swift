@@ -40,6 +40,13 @@ final class Renderer {
         customResolver = resolver
     }
 
+    /// Returns the live cell view for `id` when the cell is currently within
+    /// the preload window, otherwise `nil`. Used by the facade to satisfy
+    /// `ChatScrollView.visibleView(for:)`.
+    func view(for id: ItemID) -> UIView? {
+        visibleItems[id]?.view
+    }
+
     /// Synchronizes both items and (sticky) header cells against the current
     /// viewport. Items are placed in the preload window; headers are placed at
     /// their pinned y derived from the sticky math below.

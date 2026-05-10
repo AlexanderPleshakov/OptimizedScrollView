@@ -20,6 +20,10 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
     private var pendingPrefetchTop: Task<Void, Never>?
     private var pendingPrefetchBottom: Task<Void, Never>?
     private var pendingJump: Task<Void, Never>?
+    /// Set when a `scroll(to:animated:)` flow is in flight. Animated path:
+    /// cleared in `scrollViewDidEndScrollingAnimation`. Non-animated path:
+    /// cleared synchronously at the call site after firing the delegate.
+    private var pendingScrollTarget: ItemID?
 
     private var lastBoundsSize: CGSize = .zero
     private var didInitialPin = false
@@ -335,6 +339,14 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         scrollSyncToBottom(animated: animated)
     }
 
+    /// Returns the live cell view for `id` when it is currently rendered.
+    /// Hosts use this from `ChatScrollViewDelegate.didScrollToItem(id:)` to
+    /// apply a transient visual (e.g. flash a highlight on the jump target).
+    /// Returns `nil` if the cell is outside the renderer's preload window.
+    public func visibleView(for id: ItemID) -> UIView? {
+        renderer.view(for: id)
+    }
+
     /// Switches the view to the live-tail list (the one with no `bottomCursor`)
     /// and scrolls it to the very end. Used to acknowledge a "new messages"
     /// banner: takes the user from a history slice back to the conversation
@@ -428,6 +440,7 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
 
     public func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
         scrollState.didEndProgrammaticScroll()
+        firePendingScrollTarget()
     }
 
     // MARK: - Snapshot application
@@ -497,11 +510,15 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         // Force layout so frames exist for the target id we're about to scroll to.
         layoutIfNeeded()
         guard let frame = engine.store.frame(for: targetId) else { return }
-        let target = max(-contentInset.top, frame.minY)
+        let target = centeredOffsetY(for: frame)
         scrollState.willBeginProgrammaticScroll()
+        pendingScrollTarget = targetId
         let animate = isSameList && requestedAnimated
         setContentOffset(CGPoint(x: 0, y: target), animated: animate)
-        if !animate { scrollState.didEndProgrammaticScroll() }
+        if !animate {
+            scrollState.didEndProgrammaticScroll()
+            firePendingScrollTarget()
+        }
     }
 
     private func applySnapshotDiff(_ snapshot: DataSnapshot) {
@@ -610,10 +627,14 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
 
     private func scrollSync(to id: ItemID, animated: Bool) {
         guard let frame = engine.store.frame(for: id) else { return }
-        let target = max(-contentInset.top, frame.minY)
+        let target = centeredOffsetY(for: frame)
         scrollState.willBeginProgrammaticScroll()
+        pendingScrollTarget = id
         setContentOffset(CGPoint(x: 0, y: target), animated: animated)
-        if !animated { scrollState.didEndProgrammaticScroll() }
+        if !animated {
+            scrollState.didEndProgrammaticScroll()
+            firePendingScrollTarget()
+        }
     }
 
     private func scrollSyncToBottom(animated: Bool) {
@@ -621,6 +642,25 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         scrollState.willBeginProgrammaticScroll()
         setContentOffset(CGPoint(x: 0, y: target), animated: animated)
         if !animated { scrollState.didEndProgrammaticScroll() }
+    }
+
+    /// Offset that centres `frame` vertically inside the user-visible region
+    /// (`bounds.height - contentInset.bottom` — `contentInset.top` is treated
+    /// as pure prepend headroom, not a visible inset). Clamped to the valid
+    /// `contentOffset.y` range so jumping to items near the top or bottom of
+    /// the layout doesn't request an unreachable offset.
+    private func centeredOffsetY(for frame: CGRect) -> CGFloat {
+        let visibleHeight = bounds.height - contentInset.bottom
+        let desired = frame.midY - visibleHeight / 2
+        let minOffset = -contentInset.top
+        let maxOffset = max(minOffset, engine.contentHeight - visibleHeight)
+        return min(max(desired, minOffset), maxOffset)
+    }
+
+    private func firePendingScrollTarget() {
+        guard let id = pendingScrollTarget else { return }
+        pendingScrollTarget = nil
+        chatDelegate?.didScrollToItem(id: id)
     }
 
     private func syncTopInsetForPrependHeadroom() {
