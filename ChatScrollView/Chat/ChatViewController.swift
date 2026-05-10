@@ -34,6 +34,7 @@ final class ChatViewController: UIViewController, ChatScrollViewDelegate {
 
         chat.translatesAutoresizingMaskIntoConstraints = false
         chat.backgroundColor = .secondarySystemBackground
+        chat.showsStickyHeadersOnlyWhileScrolling = true
 
         badgeButton.translatesAutoresizingMaskIntoConstraints = false
         var badgeConfig = UIButton.Configuration.filled()

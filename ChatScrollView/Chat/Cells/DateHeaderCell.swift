@@ -12,7 +12,7 @@ final class DateHeaderCell: UIView, ChatCellView {
         super.init(frame: frame)
         // Match chat background so the header pill occludes anything that
         // scrolls underneath when sticky-pinned.
-        backgroundColor = .secondarySystemBackground
+        backgroundColor = .clear
 
         pill.translatesAutoresizingMaskIntoConstraints = false
         pill.backgroundColor = .systemGray4

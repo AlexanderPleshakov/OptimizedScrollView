@@ -28,6 +28,17 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
     private var lastBoundsSize: CGSize = .zero
     private var didInitialPin = false
 
+    /// When `true`, sticky headers fade out while the scroll is idle and
+    /// fade back in when the user (or a programmatic scroll) starts scrolling.
+    /// Defaults to `false` — headers are always visible. Toggling this at
+    /// runtime updates header visibility immediately.
+    public var showsStickyHeadersOnlyWhileScrolling: Bool = false {
+        didSet {
+            guard showsStickyHeadersOnlyWhileScrolling != oldValue else { return }
+            updateHeadersVisibility(animated: false)
+        }
+    }
+
     public init() {
         super.init(frame: .zero)
         contentInsetAdjustmentBehavior = .never
@@ -428,19 +439,23 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
 
     public func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
         scrollState.willBeginDragging()
+        updateHeadersVisibility(animated: true)
     }
 
     public func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
         scrollState.didEndDragging(willDecelerate: decelerate)
+        updateHeadersVisibility(animated: true)
     }
 
     public func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
         scrollState.didEndDecelerating()
+        updateHeadersVisibility(animated: true)
     }
 
     public func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
         scrollState.didEndProgrammaticScroll()
         firePendingScrollTarget()
+        updateHeadersVisibility(animated: true)
     }
 
     // MARK: - Snapshot application
@@ -512,12 +527,14 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         guard let frame = engine.store.frame(for: targetId) else { return }
         let target = centeredOffsetY(for: frame)
         scrollState.willBeginProgrammaticScroll()
+        updateHeadersVisibility(animated: true)
         pendingScrollTarget = targetId
         let animate = isSameList && requestedAnimated
         setContentOffset(CGPoint(x: 0, y: target), animated: animate)
         if !animate {
             scrollState.didEndProgrammaticScroll()
             firePendingScrollTarget()
+            updateHeadersVisibility(animated: true)
         }
     }
 
@@ -629,19 +646,25 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         guard let frame = engine.store.frame(for: id) else { return }
         let target = centeredOffsetY(for: frame)
         scrollState.willBeginProgrammaticScroll()
+        updateHeadersVisibility(animated: true)
         pendingScrollTarget = id
         setContentOffset(CGPoint(x: 0, y: target), animated: animated)
         if !animated {
             scrollState.didEndProgrammaticScroll()
             firePendingScrollTarget()
+            updateHeadersVisibility(animated: true)
         }
     }
 
     private func scrollSyncToBottom(animated: Bool) {
         let target = bottomPinnedOffsetY()
         scrollState.willBeginProgrammaticScroll()
+        updateHeadersVisibility(animated: true)
         setContentOffset(CGPoint(x: 0, y: target), animated: animated)
-        if !animated { scrollState.didEndProgrammaticScroll() }
+        if !animated {
+            scrollState.didEndProgrammaticScroll()
+            updateHeadersVisibility(animated: true)
+        }
     }
 
     /// Offset that centres `frame` vertically inside the user-visible region
@@ -661,6 +684,15 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         guard let id = pendingScrollTarget else { return }
         pendingScrollTarget = nil
         chatDelegate?.didScrollToItem(id: id)
+    }
+
+    /// Drives the pinned-header alpha based on scroll state and the
+    /// `showsStickyHeadersOnlyWhileScrolling` toggle. Only the actively
+    /// pinned-to-top header fades — headers at their natural y stay visible.
+    /// Called after every `ScrollStateMachine` transition.
+    private func updateHeadersVisibility(animated: Bool) {
+        let hide = showsStickyHeadersOnlyWhileScrolling && !scrollState.isScrolling
+        renderer.setHidesPinnedHeader(hide, animated: animated)
     }
 
     private func syncTopInsetForPrependHeadroom() {

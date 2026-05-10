@@ -13,6 +13,10 @@ final class ScrollStateMachine {
         state == .userScrolling || state == .decelerating
     }
 
+    var isScrolling: Bool {
+        state != .idle
+    }
+
     func willBeginDragging() { state = .userScrolling }
 
     func didEndDragging(willDecelerate: Bool) {
