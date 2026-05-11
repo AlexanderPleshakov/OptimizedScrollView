@@ -43,8 +43,11 @@ final class ChatViewController: UIViewController, ChatScrollViewDelegate {
         badgeConfig.cornerStyle = .capsule
         badgeConfig.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 14, bottom: 4, trailing: 14)
         badgeButton.configuration = badgeConfig
-        badgeButton.isHidden = true
+        // Chat manages alpha based on scroll position; start fully transparent
+        // so the initial bottom-pinned load doesn't briefly show the badge.
+        badgeButton.alpha = 0
         badgeButton.addTarget(self, action: #selector(badgeTapped), for: .touchUpInside)
+        updateBadgeTitle()
 
         view.addSubview(toolbar)
         view.addSubview(chat)
@@ -84,6 +87,7 @@ final class ChatViewController: UIViewController, ChatScrollViewDelegate {
             )
         }
         chat.chatDelegate = self
+        chat.setNewItemsBadge(badgeButton)
         chat.setDataSourceProvider(provider)
     }
 
@@ -103,26 +107,44 @@ final class ChatViewController: UIViewController, ChatScrollViewDelegate {
     }
 
     @objc private func badgeTapped() {
+        // Chat will fade the badge to 0 as soon as the scroll reaches the
+        // bottom; we still reset the local pending counter so the title is
+        // accurate the next time it's shown.
         pendingNewItemsCount = 0
-        badgeButton.isHidden = true
+        updateBadgeTitle()
         chat.scrollToLiveTail(animated: true)
+    }
+
+    private func updateBadgeTitle() {
+        let title = pendingNewItemsCount > 0
+            ? "+\(pendingNewItemsCount) new ↓"
+            : "↓ Bottom"
+        badgeButton.setTitle(title, for: .normal)
     }
 
     // MARK: ChatScrollViewDelegate
 
     func didReceiveNewItemsWhileScrolledUp(count: Int) {
         pendingNewItemsCount += count
-        badgeButton.setTitle("+\(pendingNewItemsCount) new ↓", for: .normal)
-        badgeButton.isHidden = false
+        updateBadgeTitle()
     }
 
     func didFailLoad(_ error: Error) {
         print("Load failed: \(error)")
     }
-    
+
     func didScrollToItem(id: ItemID) {
         guard let cellView = chat.visibleView(for: id) else { return }
         flashHighlight(on: cellView)
+    }
+
+    func didShowItem(id: ItemID) {
+        // Items appearing in the viewport drain the "unread" counter. The
+        // chat decides badge visibility (it fades to 0 once the user has
+        // scrolled all the way down); we only have to keep the title fresh.
+        guard pendingNewItemsCount > 0 else { return }
+        pendingNewItemsCount -= 1
+        updateBadgeTitle()
     }
 
     /// Layers a translucent yellow overlay on top of the cell and fades it

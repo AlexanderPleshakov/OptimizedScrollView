@@ -16,6 +16,10 @@ final class Renderer {
     private var visibleHeaders: [ItemID: VisibleCell] = [:]
     private var customResolver: ((any ChatItem) -> String)?
 
+    /// Invoked once per item when its cell is first dequeued into the visible
+    /// window. The facade routes this to `ChatScrollViewDelegate.didShowItem`.
+    var onNewItemAppear: ((ItemID) -> Void)?
+
     /// When `true`, the renderer drives the alpha of *actively pinned* sticky
     /// headers (those whose `pinnedY > naturalY`) to 0. Headers sitting at
     /// their natural y stay fully visible. The facade flips this on/off in
@@ -28,6 +32,13 @@ final class Renderer {
     /// `updateVisibleHeaders` on every viewport tick and consulted by
     /// `setHidesPinnedHeader` to know which header views to fade.
     private var pinnedHeaderIds: Set<ItemID> = []
+
+    /// Ids of items whose cell frame intersected the actual viewport on the
+    /// last `updateVisibleItems` tick. Used to fire `onItemAppear` on the
+    /// transition from out-of-viewport → in-viewport (so the callback runs
+    /// when the user actually *sees* the item, not when its cell is merely
+    /// dequeued into the preload buffer one screen below the viewport).
+    private var inViewportIds: Set<ItemID> = []
     
     /// The height of the additional render from above and below.
     ///
@@ -182,6 +193,31 @@ final class Renderer {
                 }
                 visibleItems[attr.id] = VisibleCell(view: view, reuseId: reuseId)
             }
+        }
+
+        // Viewport-entry detection: fire `onItemAppear` for cells that
+        // transitioned from "not fully visible" to "fully visible" on this
+        // tick. A cell is "fully visible" when its frame is entirely
+        // contained within `viewport` — partial-overlap cells (still
+        // peeking out below the viewport bottom, or up past the top) don't
+        // qualify, so a small scroll that only nudges an off-screen cell a
+        // few points into view does NOT trigger the callback. Hosts receive
+        // a strong "user actually saw this whole cell" signal.
+        //
+        // Cells taller than the viewport can never be "fully inside"; that
+        // edge case is accepted — chat-cell heights are bounded in practice
+        // and a stricter signal is more useful to hosts than a noisier one.
+        var newInViewport: Set<ItemID> = []
+        for (id, cell) in visibleItems {
+            let f = cell.view.frame
+            if f.minY >= viewport.minY && f.maxY <= viewport.maxY {
+                newInViewport.insert(id)
+            }
+        }
+        let entered = newInViewport.subtracting(inViewportIds)
+        inViewportIds = newInViewport
+        if let onNewItemAppear {
+            for id in entered { onNewItemAppear(id) }
         }
     }
 

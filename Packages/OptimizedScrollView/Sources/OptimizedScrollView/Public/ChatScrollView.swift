@@ -9,7 +9,38 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
     private let engine = LayoutEngine(store: LayoutStore())
     private lazy var anchors = AnchorController(store: engine.store)
     private let scrollState = ScrollStateMachine()
-    private lazy var renderer = Renderer(store: engine.store, pool: pool, container: self)
+    private lazy var renderer: Renderer = {
+        let r = Renderer(store: engine.store, pool: pool, container: self)
+        r.onNewItemAppear = { [weak self] id in
+            // Filter through `pendingShowIds`: only items that the host
+            // pushed via `appendNewItems` (and haven't yet been seen) bubble
+            // up as `didShowItem`. Items that simply enter the viewport
+            // during a scroll past pre-existing history don't fire.
+            guard let self, self.pendingShowIds.remove(id) != nil else { return }
+            self.chatDelegate?.didShowItem(id: id)
+        }
+        return r
+    }()
+
+    /// Host-supplied "new items" affordance. The facade drives only its
+    /// `alpha` (1 when scroll is away from the bottom, 0 when pinned to it);
+    /// the host owns the view, its hierarchy, positioning, and content.
+    /// Pass `nil` to unregister; `alpha` is restored to 1 in that case.
+    private weak var newItemsBadgeView: UIView?
+
+    /// Ids of items that arrived via `appendNewItems` and haven't yet
+    /// transitioned into the viewport. The renderer's `onItemAppear`
+    /// callback is filtered through this set so `didShowItem` only fires
+    /// for items the host actually pushed — old items that simply enter
+    /// the viewport during a scroll don't generate spurious read-events.
+    private var pendingShowIds: Set<ItemID> = []
+
+    /// `true` between the moment a `appendNewItems` happens while the user
+    /// is at the bottom and the moment the resulting scroll-to-bottom has
+    /// completed. During this window the badge stays hidden — the model
+    /// state transiently reads "not at bottom" (content height grew before
+    /// the offset has caught up), but we know we're heading right back.
+    private var isSettlingToBottomAfterPush = false
 
     private var items: [ItemID: any ChatItem] = [:]
     private var headerProvider: StickyHeaderProvider?
@@ -106,6 +137,14 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
     /// `didReceiveNewItemsWhileScrolledUp` so the host can show a banner.
     public func appendNewItems(_ newItems: [any ChatItem]) {
         guard !newItems.isEmpty else { return }
+        // Track ids unconditionally — even when the push lands in a list
+        // other than the one currently displayed (jump-then-push case),
+        // these items become reachable later via `scrollToLiveTail` or via
+        // a pagination merge that bridges the two lists. The renderer's
+        // viewport-entry callback filters through `pendingShowIds`, so the
+        // host gets a `didShowItem` exactly once when the user finally
+        // sees each pushed item — and the badge counter zeros out cleanly.
+        for item in newItems { pendingShowIds.insert(item.id) }
         if let dataSource {
             Task { @MainActor [weak self] in
                 guard let snapshot = await dataSource.append(items: newItems) else { return }
@@ -114,6 +153,7 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         } else {
             // No data source bound — fall through to a direct append.
             let wasAtBottom = isPinnedToBottom()
+            if wasAtBottom { isSettlingToBottomAfterPush = true }
             let endIndex = engine.store.order.count
             let changes = newItems.enumerated().map { Change.insert($1, at: endIndex + $0) }
             commitPushApply(changes, wasAtBottom: wasAtBottom, addedCount: newItems.count)
@@ -140,23 +180,30 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
             UIView.animate(
                 withDuration: 0.25,
                 delay: 0,
-                options: [.curveEaseInOut, .beginFromCurrentState]
-            ) { [self] in
-                // `apply` runs through `commitMutation`, which restores the
-                // pre-mutation offset via `AnchorController`. In short-content
-                // mode `reconcileBottomFlow` shifted every stored frame upward
-                // to keep the last item pinned to the viewport bottom; the
-                // anchor formula then visually undoes that shift by setting
-                // `contentOffset.y` into the rubber-band region (negative).
-                // The two cancel out and the new item ends up *below* the
-                // visible bounds. Re-pin to the bottom inside the animation
-                // block so the offset target matches the frame shift.
-                contentOffset.y = bottomPinnedOffsetY()
-            }
+                options: [.curveEaseInOut, .beginFromCurrentState],
+                animations: { [self] in
+                    // `apply` runs through `commitMutation`, which restores the
+                    // pre-mutation offset via `AnchorController`. In short-content
+                    // mode `reconcileBottomFlow` shifted every stored frame upward
+                    // to keep the last item pinned to the viewport bottom; the
+                    // anchor formula then visually undoes that shift by setting
+                    // `contentOffset.y` into the rubber-band region (negative).
+                    // The two cancel out and the new item ends up *below* the
+                    // visible bounds. Re-pin to the bottom inside the animation
+                    // block so the offset target matches the frame shift.
+                    contentOffset.y = bottomPinnedOffsetY()
+                },
+                completion: { [weak self] _ in
+                    self?.endBottomSettlingAfterPush()
+                }
+            )
         } else {
             apply(changes)
             if wasAtBottom {
                 scrollSyncToBottom(animated: true)
+                // Flag is cleared in `scrollViewDidEndScrollingAnimation`
+                // (or in `scrollViewWillBeginDragging` if the user grabs
+                // the scroll mid-animation).
             } else {
                 chatDelegate?.didReceiveNewItemsWhileScrolledUp(count: addedCount)
             }
@@ -358,6 +405,24 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         renderer.view(for: id)
     }
 
+    /// Registers a host-supplied affordance (e.g. a "+N new ↓" button) that
+    /// the chat will auto-fade based on the scroll position: fully visible
+    /// when the user is scrolled away from the bottom, fully transparent
+    /// when the scroll reaches the bottom. The host keeps full ownership of
+    /// the view (its superview, layout constraints, content) — the chat
+    /// only touches `alpha`. Pass `nil` to detach.
+    public func setNewItemsBadge(_ view: UIView?) {
+        // Restore alpha on the previously-attached view so detaching doesn't
+        // leave a stale faded-out state if the host re-uses the view later.
+        if let prev = newItemsBadgeView, prev !== view {
+            prev.alpha = 1
+        }
+        newItemsBadgeView = view
+        // Apply the current scroll state immediately, without animation —
+        // attaching mid-scroll shouldn't trigger a fade-in.
+        updateBadgeVisibility(animated: false)
+    }
+
     /// Switches the view to the live-tail list (the one with no `bottomCursor`)
     /// and scrolls it to the very end. Used to acknowledge a "new messages"
     /// banner: takes the user from a history slice back to the conversation
@@ -435,11 +500,16 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
     public func scrollViewDidScroll(_ scrollView: UIScrollView) {
         renderer.updateVisible(viewport: currentViewport(), items: items, headerProvider: headerProvider)
         tickPrefetch()
+        updateBadgeVisibility(animated: true)
     }
 
     public func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
         scrollState.willBeginDragging()
         updateHeadersVisibility(animated: true)
+        // If the user grabs the scroll while we were still settling toward
+        // the bottom after a push, hand control back to the regular
+        // position-based badge logic.
+        endBottomSettlingAfterPush()
     }
 
     public func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
@@ -456,6 +526,7 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         scrollState.didEndProgrammaticScroll()
         firePendingScrollTarget()
         updateHeadersVisibility(animated: true)
+        endBottomSettlingAfterPush()
     }
 
     // MARK: - Snapshot application
@@ -474,24 +545,35 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
         if currentListId == snapshot.listId {
             let wasAtBottom = isPinnedToBottom()
             let willShift = wasAtBottom && engine.bottomFlowOffset > 0
+            // `pendingShowIds` is populated in `appendNewItems` itself,
+            // before the async dataSource call, so it's already up to date
+            // here for both same-list and cross-list outcomes.
+            if wasAtBottom { isSettlingToBottomAfterPush = true }
             if willShift {
                 applySnapshotDiff(snapshot)
                 UIView.animate(
                     withDuration: 0.25,
                     delay: 0,
-                    options: [.curveEaseInOut, .beginFromCurrentState]
-                ) { [self] in
-                    // See the matching comment in `commitPushApply`:
-                    // `commitMutation`'s anchor restore would push
-                    // `contentOffset.y` into rubber-band territory and
-                    // visually cancel the bottom-flow frame shift, hiding
-                    // the freshly appended item below the screen edge.
-                    contentOffset.y = bottomPinnedOffsetY()
-                }
+                    options: [.curveEaseInOut, .beginFromCurrentState],
+                    animations: { [self] in
+                        // See the matching comment in `commitPushApply`:
+                        // `commitMutation`'s anchor restore would push
+                        // `contentOffset.y` into rubber-band territory and
+                        // visually cancel the bottom-flow frame shift, hiding
+                        // the freshly appended item below the screen edge.
+                        contentOffset.y = bottomPinnedOffsetY()
+                    },
+                    completion: { [weak self] _ in
+                        self?.endBottomSettlingAfterPush()
+                    }
+                )
             } else {
                 applySnapshotDiff(snapshot)
                 if wasAtBottom {
                     scrollSyncToBottom(animated: true)
+                    // Flag cleared in `scrollViewDidEndScrollingAnimation`
+                    // (or `scrollViewWillBeginDragging` if the user
+                    // interrupts the scroll).
                 } else {
                     chatDelegate?.didReceiveNewItemsWhileScrolledUp(count: addedCount)
                 }
@@ -693,6 +775,41 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
     private func updateHeadersVisibility(animated: Bool) {
         let hide = showsStickyHeadersOnlyWhileScrolling && !scrollState.isScrolling
         renderer.setHidesPinnedHeader(hide, animated: animated)
+    }
+
+    /// Syncs the host-supplied "new items" badge alpha with the scroll
+    /// position: 1 when the user is anywhere above the bottom, 0 once the
+    /// scroll has reached the bottom. While `isSettlingToBottomAfterPush`
+    /// is on, the badge is force-hidden — the model state transiently
+    /// reads "not at bottom" right after a push grows `contentSize`, and
+    /// we don't want the badge to flash before the scroll-to-bottom
+    /// animation catches up. The guarded `alpha != target` check keeps
+    /// the per-tick call cheap.
+    private func updateBadgeVisibility(animated: Bool) {
+        guard let badge = newItemsBadgeView else { return }
+        let target: CGFloat = (isPinnedToBottom() || isSettlingToBottomAfterPush) ? 0 : 1
+        guard badge.alpha != target else { return }
+        if animated {
+            UIView.animate(
+                withDuration: 0.2,
+                delay: 0,
+                options: [.beginFromCurrentState, .curveEaseInOut]
+            ) {
+                badge.alpha = target
+            }
+        } else {
+            badge.alpha = target
+        }
+    }
+
+    /// Clears `isSettlingToBottomAfterPush` and reconciles badge alpha.
+    /// Called from the UIView.animate completion (willShift path), from
+    /// `scrollViewDidEndScrollingAnimation` (long-content path), and from
+    /// `scrollViewWillBeginDragging` (user grabs the scroll mid-settling).
+    private func endBottomSettlingAfterPush() {
+        guard isSettlingToBottomAfterPush else { return }
+        isSettlingToBottomAfterPush = false
+        updateBadgeVisibility(animated: false)
     }
 
     private func syncTopInsetForPrependHeadroom() {
