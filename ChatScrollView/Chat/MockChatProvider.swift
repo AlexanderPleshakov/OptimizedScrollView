@@ -163,10 +163,13 @@ extension MockChatProvider {
     }
 
     func makePushMessage() -> Message {
+        let seed = Int.random(in: 0..<10_000)
+        return makePushMessage(text: "🆕 \(Self.fakeText(seed: seed))")
+    }
+
+    func makePushMessage(text: String) -> Message {
         let cal = Calendar.current
         let date = cal.startOfDay(for: Date())
-        let seed = Int.random(in: 0..<10_000)
-        let text = "🆕 \(Self.fakeText(seed: seed))"
         return Message(
             id: ItemID("push-\(UUID().uuidString.prefix(8))"),
             text: text,

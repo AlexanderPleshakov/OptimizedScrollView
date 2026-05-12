@@ -339,25 +339,44 @@ public final class ChatScrollView: UIScrollView, UIScrollViewDelegate {
 
     // MARK: - Insets / scroll
 
-    public func setBottomInset(_ inset: CGFloat, animated: Bool) {
-        let wasAtBottom = isPinnedToBottom()
-        let capture = anchors.capture(contentOffsetY: contentOffset.y, topInset: contentInset.top)
+    public func setBottomInset(_ inset: CGFloat, animated: Bool, shiftingOffset: Bool = true) {
+        let oldInset = contentInset.bottom
+        guard oldInset != inset else { return }
+        let delta = inset - oldInset
 
         let apply: () -> Void = { [self] in
             contentInset.bottom = inset
             verticalScrollIndicatorInsets.bottom = inset
-            // Bottom inset shrinks the visible area below the top inset, so
-            // the bottom-flow offset may need to grow/shrink — reconcile
-            // before consulting engine geometry.
+            // Bottom inset shrinks the un-obscured viewport, so the
+            // bottom-flow offset may need to grow/shrink in short-content
+            // mode — reconcile before consulting engine geometry.
             engine.setViewportHeight(bounds.height - inset)
             syncTopInsetForPrependHeadroom()
             let newSize = CGSize(width: bounds.width, height: engine.contentHeight)
             if contentSize != newSize { contentSize = newSize }
-            if wasAtBottom {
-                contentOffset.y = bottomPinnedOffsetY()
-            } else if let c = capture, let y = anchors.restoredOffsetY(for: c, currentTopInset: contentInset.top) {
-                contentOffset.y = y
+
+            if shiftingOffset {
+                // Shift `contentOffset.y` by exactly `delta` so the *bottom*
+                // of the un-obscured visible content stays anchored to the
+                // same content-y. The user's last visible message (just
+                // above the keyboard or input bar) doesn't disappear
+                // behind the newly-grown inset — matching iMessage /
+                // WhatsApp behaviour. Works uniformly for "at-bottom",
+                // "middle", and "at-top" cases (capped to the valid offset
+                // range).
+                let minOffset = -contentInset.top
+                let maxOffset = max(minOffset, engine.contentHeight - (bounds.height - inset))
+                let target = min(max(contentOffset.y + delta, minOffset), maxOffset)
+                if contentOffset.y != target { contentOffset.y = target }
             }
+            // When `shiftingOffset == false` the caller wants the scroll
+            // content to look frozen while the inset changes underneath —
+            // used for interactive keyboard dismissal: as the keyboard
+            // moves down, the un-obscured area grows, but the items the
+            // user is looking at stay at the same screen position
+            // (the freshly-revealed strip below shows older content
+            // already in the layout, not a jump).
+
             // Push the post-shift frames to UIView during the animation
             // block so item movement (when bottom-flow changed) animates
             // alongside the inset/offset.
